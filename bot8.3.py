@@ -1,5 +1,5 @@
 import asyncio
-import ccxt.async_support as ccxt
+import ccxt.pro as ccxt
 import aiosqlite
 import numpy as np
 import talib
@@ -53,6 +53,28 @@ logging.basicConfig(
         logging.FileHandler("trading_bot.log", mode="a")
     ]
 )
+
+logger = logging.getLogger(__name__)
+
+
+async def notify_telegram(msg: str):
+    if not (CONFIG.get("TELEGRAM_TOKEN") and CONFIG.get("TELEGRAM_CHAT_ID")):
+        return
+    url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage"
+    async with aiohttp.ClientSession() as s:
+        r = await s.post(url, data={'chat_id': CONFIG['TELEGRAM_CHAT_ID'], 'text': msg})
+        text = await r.text()
+        if r.status != 200:
+            logger.error(f"Telegram error {r.status}: {text}")
+
+
+async def filter_valid_symbols(exchange, symbols):
+    markets = await exchange.load_markets()
+    valid = [s for s in symbols if s in markets]
+    invalid = set(symbols) - set(valid)
+    if invalid:
+        logger.warning(f"Símbolos inválidos descartados: {invalid}")
+    return valid
 
 # ========================================================
 # MÓDULO DE MACHINE LEARNING CON FEATURES ENRIQUECIDAS
@@ -146,6 +168,11 @@ class AsyncTradingBot:
 
     async def setup(self):
         await self.setup_database()
+        symbols = await filter_valid_symbols(self.exchange, [self.symbol])
+        if not symbols:
+            logger.error("No hay símbolos válidos.")
+            raise RuntimeError("Símbolo inválido")
+        self.symbol = symbols[0]
         self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context))
 
     async def setup_database(self):
@@ -181,7 +208,7 @@ class AsyncTradingBot:
         if self._cached_eur_rate and (datetime.now(timezone.utc) - self._eur_cache_time).total_seconds() < 10:
             return self._cached_eur_rate
         try:
-            ticker = await self.fetch_with_retry(self.exchange.fetch_ticker, "EUR/USDT")
+            ticker = await self.fetch_with_retry(self.exchange.watch_ticker, "EUR/USDT")
             rate = ticker['last']
             self._cached_eur_rate = rate
             self._eur_cache_time = datetime.now(timezone.utc)
@@ -215,7 +242,7 @@ class AsyncTradingBot:
                 else:
                     pair = f"{asset}/USDT"
                     try:
-                        ticker = await self.fetch_with_retry(self.exchange.fetch_ticker, pair)
+                        ticker = await self.fetch_with_retry(self.exchange.watch_ticker, pair)
                         value_usdt = amount * ticker['last']
                     except Exception as e:
                         logging.warning(f"No se pudo obtener ticker para {pair}: {e}")
@@ -279,7 +306,7 @@ class AsyncTradingBot:
                 else:
                     pair = f"{asset}/USDT"
                     try:
-                        ticker = await self.fetch_with_retry(self.exchange.fetch_ticker, pair)
+                        ticker = await self.fetch_with_retry(self.exchange.watch_ticker, pair)
                         total_usdt += amount * ticker['last']
                     except Exception as e:
                         logging.warning(f"No se pudo obtener ticker para {pair}: {e}")
@@ -292,7 +319,7 @@ class AsyncTradingBot:
         try:
             # Calcular since para 100 velas de 5m (500 minutos atrás)
             since = int((datetime.now(timezone.utc) - timedelta(minutes=500)).timestamp() * 1000)
-            data = await self.fetch_with_retry(self.exchange.fetch_ohlcv, par, '5m', since, 100)
+            data = await self.fetch_with_retry(self.exchange.watch_ohlcv, par, '5m', since, 100)
         except Exception as e:
             logging.error(f"Error al obtener OHLCV: {e}")
             return {"rsi": 0, "ema": 0, "macd": 0, "atr": 0,
@@ -330,7 +357,7 @@ class AsyncTradingBot:
         try:
             # Calcular since para 50 velas de 1h (50 horas atrás)
             since = int((datetime.now(timezone.utc) - timedelta(hours=50)).timestamp() * 1000)
-            data = await self.fetch_with_retry(self.exchange.fetch_ohlcv, self.symbol, '1h', since, 50)
+            data = await self.fetch_with_retry(self.exchange.watch_ohlcv, self.symbol, '1h', since, 50)
         except Exception as e:
             logging.error(f"Error al obtener OHLCV de 1h: {e}")
             return None
@@ -383,7 +410,7 @@ class AsyncTradingBot:
         if par is None:
             par = self.symbol
         try:
-            ticker = await self.fetch_with_retry(self.exchange.fetch_ticker, par)
+            ticker = await self.fetch_with_retry(self.exchange.watch_ticker, par)
             return ticker['last']
         except Exception as e:
             logging.error(f"Error al obtener precio para {par}: {e}")
@@ -424,6 +451,7 @@ class AsyncTradingBot:
             if self.order_open:
                 mensaje = f"❌ Orden cerrada por *{razon}*. Precio de entrada: {self.entry_price:.2f}"
                 await self.enviar_mensaje_telegram(mensaje)
+                await notify_telegram(mensaje)
                 saldo = await self.obtener_saldo_total()
                 _, _, atr = await self.calcular_probabilidades(self.symbol)
                 distancia_sl = atr * self.config["ATR_MULTIPLIER_STOP"]
@@ -451,6 +479,7 @@ class AsyncTradingBot:
                            f"Precio de entrada: {self.entry_price:.2f}\n"
                            f"Tamaño de posición sugerido: {posicion_sugerida:.4f} unidades")
                 await self.enviar_mensaje_telegram(mensaje)
+                await notify_telegram(mensaje)
 
     async def evaluar_mercado(self):
         async with self.lock:
@@ -530,7 +559,7 @@ class AsyncTradingBot:
         try:
             # Se obtienen 300 velas de 1h para contar con suficientes datos (incluida la EMA de tendencia)
             since = int((datetime.now(timezone.utc) - timedelta(hours=300)).timestamp() * 1000)
-            ohlcv = await self.fetch_with_retry(self.exchange.fetch_ohlcv, self.symbol, '1h', since, 300)
+            ohlcv = await self.fetch_with_retry(self.exchange.watch_ohlcv, self.symbol, '1h', since, 300)
         except Exception as e:
             logging.error("Error en backtesting: " + str(e))
             await self.enviar_mensaje_telegram("Error en backtesting.")
@@ -710,10 +739,36 @@ try:
 except ImportError:
     logging.info("uvloop no disponible, se usará el loop estándar.")
 
-if __name__ == "__main__":
+async def main():
     bot = AsyncTradingBot(CONFIG)
     try:
-        asyncio.run(bot.iniciar_bot())
-    except KeyboardInterrupt:
-        logging.info("Bot detenido por el usuario.")
-        asyncio.run(bot.cerrar())
+        await bot.iniciar_bot()
+    finally:
+        await bot.cerrar()
+
+
+async def test_order(symbol, side, amount):
+    exchange = ccxt.binance({
+        'apiKey': CONFIG['API_KEY'],
+        'secret': CONFIG['API_SECRET'],
+    })
+    try:
+        await exchange.load_markets()
+        await exchange.watch_ticker(symbol)
+        order = await exchange.create_market_order(symbol, side, amount)
+        print(order)
+        await notify_telegram(f"Test order {side} {amount} {symbol} ejecutada")
+    except Exception as e:
+        print(f"Error test order: {e}")
+        await notify_telegram(f"Error test order: {e}")
+    finally:
+        await exchange.close()
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) == 4:
+        sym, side, amt = sys.argv[1], sys.argv[2].lower(), float(sys.argv[3])
+        asyncio.run(test_order(sym, side, amt))
+    else:
+        asyncio.run(main())
