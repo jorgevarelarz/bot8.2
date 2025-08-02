@@ -1,4 +1,5 @@
 import asyncio
+import os
 import ccxt.pro as ccxt
 import aiosqlite
 import numpy as np
@@ -8,39 +9,56 @@ import aiohttp
 import ssl
 import certifi
 from datetime import datetime, timedelta, timezone
-import random
-import sqlite3
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
+from typing import Any, Dict, List, Optional, Tuple
 
 # Utiliza ccxt.pro con WebSockets y filtra dinámicamente los símbolos válidos.
 
 # =====================================
 # Configuración y Parámetros Globales
 # =====================================
-CONFIG = {
-    "API_KEY": "q41oOMmogN7lqIREmzHWtLv5ozggFojEhrA1faNZNydWhoRGSM2bwR2xkvXsheYV",
-    "API_SECRET": "p6cMNjoDQ27B1GgCO5E1t03COB0iJZskcpxjipAxuZqUiJtNlQWFr7rkGhI7oO4y",
-    "TELEGRAM_TOKEN": "8270934653:AAGyyNG5EjwKnVoTM1e3wxD2C8tJo7sZIus",
-    "TELEGRAM_CHAT_ID": "8178071066",
-    "COMISION_BINANCE": 0.001,
-    "CAPITAL_POR_OPERACION": 0.5,   # Porcentaje del saldo asignado a cada operación
-    "STOP_LOSS_PORCENTAJE": 0.02,
-    "TAKE_PROFIT_PORCENTAJE": 0.05,
-    "TRAILING_STOP_PORCENTAJE": 0.03,
-    "UMBRAL_COMPRA": 70,           # Umbral mínimo para operaciones en vivo
-    "UMBRAL_VENTA": 30,            # Umbral máximo para operaciones en vivo
-    # Parámetros para backtesting (ajustados según los resultados)
-    "UMBRAL_COMPRA_BACKTEST": 30,  # Reducido para aumentar señales de entrada
-    "UMBRAL_VENTA_BACKTEST": 25,   # Ajustado para salir con mayor frecuencia
-    "SYMBOL": "BTC/USDT",
-    "ATR_MULTIPLIER_STOP": 1.5,
-    "ATR_MULTIPLIER_TP": 3.0,
-    "EMA_TREND_PERIOD": 50,
-    "BBANDS_PERIOD": 20,
-    "BBANDS_STD": 2,
-    "BALANCE_UPDATE_INTERVAL": 300  # 5 minutos
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+required_env = {
+    "API_KEY": API_KEY,
+    "API_SECRET": API_SECRET,
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+}
+for key, value in required_env.items():
+    if not value:
+        raise ValueError(f"Environment variable {key} is required")
+
+SIMULATE = os.getenv("SIMULATE", "false").lower() in ("1", "true")
+
+CONFIG: Dict[str, Any] = {
+    "API_KEY": API_KEY,
+    "API_SECRET": API_SECRET,
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    "COMISION_BINANCE": float(os.getenv("COMISION_BINANCE", "0.001")),
+    "CAPITAL_POR_OPERACION": float(os.getenv("CAPITAL_POR_OPERACION", "0.5")),
+    "STOP_LOSS_PORCENTAJE": float(os.getenv("STOP_LOSS_PORCENTAJE", "0.02")),
+    "TAKE_PROFIT_PORCENTAJE": float(os.getenv("TAKE_PROFIT_PORCENTAJE", "0.05")),
+    "TRAILING_STOP_PORCENTAJE": float(os.getenv("TRAILING_STOP_PORCENTAJE", "0.03")),
+    "UMBRAL_COMPRA": int(os.getenv("UMBRAL_COMPRA", "70")),
+    "UMBRAL_VENTA": int(os.getenv("UMBRAL_VENTA", "30")),
+    "UMBRAL_COMPRA_BACKTEST": int(os.getenv("UMBRAL_COMPRA_BACKTEST", "30")),
+    "UMBRAL_VENTA_BACKTEST": int(os.getenv("UMBRAL_VENTA_BACKTEST", "25")),
+    "SYMBOL": os.getenv("SYMBOL", "BTC/USDT"),
+    "ATR_MULTIPLIER_STOP": float(os.getenv("ATR_MULTIPLIER_STOP", "1.5")),
+    "ATR_MULTIPLIER_TP": float(os.getenv("ATR_MULTIPLIER_TP", "3.0")),
+    "EMA_TREND_PERIOD": int(os.getenv("EMA_TREND_PERIOD", "50")),
+    "BBANDS_PERIOD": int(os.getenv("BBANDS_PERIOD", "20")),
+    "BBANDS_STD": int(os.getenv("BBANDS_STD", "2")),
+    "BALANCE_UPDATE_INTERVAL": int(os.getenv("BALANCE_UPDATE_INTERVAL", "300")),
+    "RETRIES": int(os.getenv("RETRIES", "3")),
+    "INITIAL_DELAY": float(os.getenv("INITIAL_DELAY", "1")),
+    "BACKOFF_FACTOR": float(os.getenv("BACKOFF_FACTOR", "2")),
 }
 
 # Configurar contexto SSL usando certifi
@@ -59,18 +77,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def notify_telegram(msg: str):
-    if not (CONFIG.get("TELEGRAM_TOKEN") and CONFIG.get("TELEGRAM_CHAT_ID")):
+async def notify_telegram(text: str, markdown: bool = False) -> None:
+    """Enviar un mensaje a Telegram."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
-    url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if markdown:
+        data["parse_mode"] = "Markdown"
     async with aiohttp.ClientSession() as s:
-        r = await s.post(url, data={'chat_id': CONFIG['TELEGRAM_CHAT_ID'], 'text': msg})
-        text = await r.text()
+        r = await s.post(url, data=data)
+        text_resp = await r.text()
         if r.status != 200:
-            logger.error(f"Telegram error {r.status}: {text}")
+            logger.error(f"Telegram error {r.status}: {text_resp}")
 
 
-async def filter_valid_symbols(exchange, symbols):
+async def filter_valid_symbols(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
+    """Filtra y devuelve solo los símbolos válidos disponibles en el exchange."""
     markets = await exchange.load_markets()
     valid = [s for s in symbols if s in markets]
     invalid = set(symbols) - set(valid)
@@ -81,58 +104,57 @@ async def filter_valid_symbols(exchange, symbols):
 # ========================================================
 # MÓDULO DE MACHINE LEARNING CON FEATURES ENRIQUECIDAS
 # ========================================================
-def entrenar_y_optimizar_parametros(db_path, current_umbral_compra, current_umbral_venta, current_indicators):
-    """
-    Entrena un modelo utilizando trades históricos enriquecidos con indicadores técnicos y
-    optimiza los umbrales de compra y venta basándose en la relación riesgo/recompensa.
-    """
-    conn = sqlite3.connect(db_path)
-    # Verificar si las columnas existen, si no, agregarlas
-    cursor = conn.execute("PRAGMA table_info(trades)")
-    columns = [row[1] for row in cursor.fetchall()]
-    for col in ['rsi', 'ema', 'macd', 'atr']:
-        if col not in columns:
-            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
-    conn.commit()
+async def entrenar_y_optimizar_parametros(
+    db_path: str,
+    current_umbral_compra: int,
+    current_umbral_venta: int,
+    current_indicators: Dict[str, float],
+) -> Tuple[int, int]:
+    """Entrena un modelo con datos históricos y optimiza los umbrales."""
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute("PRAGMA table_info(trades)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        for col in ["rsi", "ema", "macd", "atr"]:
+            if col not in columns:
+                await conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+        await conn.commit()
+        cursor = await conn.execute(
+            "SELECT precio, stop_loss, take_profit, rsi, ema, macd, atr FROM trades"
+        )
+        rows = await cursor.fetchall()
 
-    df = pd.read_sql_query("SELECT precio, stop_loss, take_profit, rsi, ema, macd, atr FROM trades", conn)
-    conn.close()
-
+    df = pd.DataFrame(rows, columns=["precio", "stop_loss", "take_profit", "rsi", "ema", "macd", "atr"])
     if df.empty:
         return current_umbral_compra, current_umbral_venta
 
-    df['profit_ratio'] = (df['take_profit'] - df['precio']) / (df['precio'] - df['stop_loss'] + 1e-6)
-    df['umbral_compra'] = current_umbral_compra
-    df['umbral_venta'] = current_umbral_venta
+    df["profit_ratio"] = (df["take_profit"] - df["precio"]) / (df["precio"] - df["stop_loss"] + 1e-6)
+    df["umbral_compra"] = current_umbral_compra
+    df["umbral_venta"] = current_umbral_venta
 
-    X = df[['umbral_compra', 'umbral_venta', 'rsi', 'ema', 'macd', 'atr']]
-    y = df['profit_ratio']
+    X = df[["umbral_compra", "umbral_venta", "rsi", "ema", "macd", "atr"]]
+    y = df["profit_ratio"]
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     model = RandomForestRegressor(n_estimators=50, random_state=42)
     model.fit(X_train, y_train)
 
-    # Preparar los features actuales a partir de los indicadores actuales
     base_features = np.array([
-        current_indicators['rsi'],
-        current_indicators['ema'],
-        current_indicators['macd'],
-        current_indicators['atr']
+        current_indicators["rsi"],
+        current_indicators["ema"],
+        current_indicators["macd"],
+        current_indicators["atr"],
     ])
 
-    # Nombres de columnas para el DataFrame
-    feature_names = ['umbral_compra', 'umbral_venta', 'rsi', 'ema', 'macd', 'atr']
-
+    feature_names = ["umbral_compra", "umbral_venta", "rsi", "ema", "macd", "atr"]
     mejor_score = -np.inf
     mejor_umbral_compra = current_umbral_compra
     mejor_umbral_venta = current_umbral_venta
 
-    # Usamos un DataFrame para pasar los features al modelo
     for uc in range(max(0, current_umbral_compra - 10), min(100, current_umbral_compra + 10) + 1):
         for uv in range(max(0, current_umbral_venta - 10), min(100, current_umbral_venta + 10) + 1):
             features = pd.DataFrame(
                 [np.concatenate((np.array([uc, uv]), base_features))],
-                columns=feature_names
+                columns=feature_names,
             )
             score = model.predict(features)[0]
             if score > mejor_score:
@@ -146,7 +168,8 @@ def entrenar_y_optimizar_parametros(db_path, current_umbral_compra, current_umbr
 # CLASE ASYNCTRADINGBOT CON MEJORAS PARA PRODUCCIÓN
 # ========================================================
 class AsyncTradingBot:
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
+        """Inicializa el bot de trading asíncrono."""
         self.config = config
         self.symbol = config.get("SYMBOL", "BTC/USDT")
         self.exchange = ccxt.binance({
@@ -194,8 +217,11 @@ class AsyncTradingBot:
                                     atr REAL)''')
         await self.db.commit()
 
-    async def fetch_with_retry(self, func, *args, retries=3, initial_delay=1, backoff_factor=2, **kwargs):
-        delay = initial_delay
+    async def fetch_with_retry(self, func, *args, **kwargs):
+        """Ejecuta una función con reintentos y backoff exponencial."""
+        retries = self.config.get("RETRIES", 3)
+        delay = self.config.get("INITIAL_DELAY", 1)
+        backoff = self.config.get("BACKOFF_FACTOR", 2)
         for attempt in range(retries):
             try:
                 return await func(*args, **kwargs)
@@ -203,7 +229,7 @@ class AsyncTradingBot:
                 if attempt == retries - 1:
                     raise e
                 await asyncio.sleep(delay)
-                delay *= backoff_factor
+                delay *= backoff
 
     async def obtener_tipo_cambio_eur(self):
         # Usamos caché durante 10 segundos para evitar múltiples solicitudes
@@ -257,21 +283,12 @@ class AsyncTradingBot:
         message = f"💰 *Balance Total: {total_eur:.2f}€*\n" + "\n".join(message_lines)
         return message
 
-    async def enviar_mensaje_telegram(self, mensaje):
-        url = f"https://api.telegram.org/bot{self.config['TELEGRAM_TOKEN']}/sendMessage"
-        data = {"chat_id": self.config['TELEGRAM_CHAT_ID'], "text": mensaje, "parse_mode": "Markdown"}
-        try:
-            async with self.session.post(url, data=data) as resp:
-                if resp.status != 200:
-                    logging.error(f"Error al enviar mensaje a Telegram. Estado: {resp.status}")
-        except Exception as e:
-            logging.error(f"Excepción al enviar mensaje a Telegram: {e}")
 
     async def enviar_saldo_telegram(self):
         ahora = datetime.now(timezone.utc)
         if (ahora - self.last_balance_sent).total_seconds() >= self.config["BALANCE_UPDATE_INTERVAL"]:
             mensaje = await self.obtener_detalle_balance()
-            await self.enviar_mensaje_telegram(mensaje)
+            await notify_telegram(mensaje, markdown=True)
             self.last_balance_sent = ahora
 
     async def enviar_pnl_horario(self):
@@ -282,7 +299,7 @@ class AsyncTradingBot:
         if self.last_hour_balance is None:
             self.last_hour_balance = total_eur
             mensaje = f"⏱ *Inicio del seguimiento horario*\nBalance inicial: {total_eur:.2f}€"
-            await self.enviar_mensaje_telegram(mensaje)
+            await notify_telegram(mensaje, markdown=True)
         else:
             diff = total_eur - self.last_hour_balance
             perc = (diff / self.last_hour_balance * 100) if self.last_hour_balance != 0 else 0
@@ -291,7 +308,7 @@ class AsyncTradingBot:
             mensaje = (f"⏱ *Resumen Horario*\n"
                        f"Balance actual: {total_eur:.2f}€\n"
                        f"{emoji} Ganancia/Pérdida: {signo}{diff:.2f}€ ({signo}{perc:.2f}%)")
-            await self.enviar_mensaje_telegram(mensaje)
+            await notify_telegram(mensaje, markdown=True)
             self.last_hour_balance = total_eur
 
     async def obtener_saldo_total(self):
@@ -315,44 +332,79 @@ class AsyncTradingBot:
                         continue
         return round(total_usdt, 2)
 
-    async def obtener_indicadores(self, par=None):
-        if par is None:
-            par = self.symbol
+    async def get_indicators(
+        self,
+        symbol: Optional[str] = None,
+        timeframe: str = "5m",
+        length: int = 100,
+    ) -> Dict[str, Any]:
+        """Obtiene indicadores técnicos y precios OHLCV."""
+        symbol = symbol or self.symbol
+        unit = timeframe[-1]
+        amount = int(timeframe[:-1])
+        delta = timedelta(minutes=amount * length) if unit == "m" else timedelta(hours=amount * length)
         try:
-            # Calcular since para 100 velas de 5m (500 minutos atrás)
-            since = int((datetime.now(timezone.utc) - timedelta(minutes=500)).timestamp() * 1000)
-            data = await self.fetch_with_retry(self.exchange.watch_ohlcv, par, '5m', since, 100)
+            since = int((datetime.now(timezone.utc) - delta).timestamp() * 1000)
+            data = await self.fetch_with_retry(self.exchange.watch_ohlcv, symbol, timeframe, since, length)
         except Exception as e:
             logging.error(f"Error al obtener OHLCV: {e}")
-            return {"rsi": 0, "ema": 0, "macd": 0, "atr": 0,
-                    "last_price": 0, "upperband": 0, "middleband": 0, "lowerband": 0}
-        
+            return {
+                "rsi": 0,
+                "ema": 0,
+                "macd": 0,
+                "atr": 0,
+                "last_price": 0,
+                "upperband": 0,
+                "middleband": 0,
+                "lowerband": 0,
+                "open_prices": np.array([]),
+                "close_prices": np.array([]),
+                "high_prices": np.array([]),
+                "low_prices": np.array([]),
+                "rsi_array": np.array([]),
+                "ema_array": np.array([]),
+                "macd_array": np.array([]),
+                "atr_array": np.array([]),
+                "upperband_array": np.array([]),
+                "lowerband_array": np.array([]),
+            }
+
         data = np.array(data)
-        close_prices = data[:, 4]
+        open_prices = data[:, 1]
         high_prices = data[:, 2]
         low_prices = data[:, 3]
-        last_price = close_prices[-1]
-
-        rsi = talib.RSI(close_prices, timeperiod=14)[-1]
-        ema = talib.EMA(close_prices, timeperiod=20)[-1]
-        macd, _, _ = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
-        atr = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)[-1]
-        upperband, middleband, lowerband = talib.BBANDS(
-            close_prices, 
+        close_prices = data[:, 4]
+        rsi_array = talib.RSI(close_prices, timeperiod=14)
+        ema_array = talib.EMA(close_prices, timeperiod=20)
+        macd_array, _, _ = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
+        atr_array = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
+        upperband_array, middleband_array, lowerband_array = talib.BBANDS(
+            close_prices,
             timeperiod=self.config["BBANDS_PERIOD"],
             nbdevup=self.config["BBANDS_STD"],
             nbdevdn=self.config["BBANDS_STD"],
-            matype=0
+            matype=0,
         )
+        last_price = close_prices[-1]
         return {
-            "rsi": round(rsi, 2),
-            "ema": round(ema, 2),
-            "macd": round(macd[-1], 2),
-            "atr": round(atr, 2),
+            "rsi": round(rsi_array[-1], 2),
+            "ema": round(ema_array[-1], 2),
+            "macd": round(macd_array[-1], 2),
+            "atr": round(atr_array[-1], 2),
             "last_price": round(last_price, 2),
-            "upperband": round(upperband[-1], 2),
-            "middleband": round(middleband[-1], 2),
-            "lowerband": round(lowerband[-1], 2)
+            "upperband": round(upperband_array[-1], 2),
+            "middleband": round(middleband_array[-1], 2),
+            "lowerband": round(lowerband_array[-1], 2),
+            "open_prices": open_prices,
+            "close_prices": close_prices,
+            "high_prices": high_prices,
+            "low_prices": low_prices,
+            "rsi_array": rsi_array,
+            "ema_array": ema_array,
+            "macd_array": macd_array,
+            "atr_array": atr_array,
+            "upperband_array": upperband_array,
+            "lowerband_array": lowerband_array,
         }
 
     async def obtener_tendencia(self):
@@ -371,10 +423,11 @@ class AsyncTradingBot:
         logging.info(f"Tendencia 1h: Precio actual {current_price:.2f} vs EMA {ema_trend:.2f} -> {'Bullish' if tendencia else 'Bearish'}")
         return tendencia
 
-    async def calcular_probabilidades(self, par=None):
+    async def calcular_probabilidades(self, par: Optional[str] = None) -> Tuple[int, int, float]:
+        """Calcula las probabilidades de compra y venta para un par dado."""
         if par is None:
             par = self.symbol
-        indicadores = await self.obtener_indicadores(par)
+        indicadores = await self.get_indicators(par)
         rsi = indicadores['rsi']
         ema = indicadores['ema']
         macd = indicadores['macd']
@@ -408,7 +461,8 @@ class AsyncTradingBot:
 
         return compra, venta, atr
 
-    async def obtener_precio(self, par=None):
+    async def obtener_precio(self, par: Optional[str] = None) -> float:
+        """Obtiene el precio actual del par especificado."""
         if par is None:
             par = self.symbol
         try:
@@ -418,7 +472,8 @@ class AsyncTradingBot:
             logging.error(f"Error al obtener precio para {par}: {e}")
             return 0.0
 
-    async def evaluar_orden(self):
+    async def evaluar_orden(self) -> None:
+        """Evalúa la orden abierta para aplicar SL/TP."""
         async with self.lock:
             if self.order_open:
                 precio_actual = await self.obtener_precio(self.symbol)
@@ -448,25 +503,40 @@ class AsyncTradingBot:
                 elif precio_actual <= self.trailing_stop:
                     await self.cerrar_orden('Trailing Stop', stop_loss, take_profit)
 
-    async def cerrar_orden(self, razon, stop_loss, take_profit):
+    async def cerrar_orden(self, razon: str, stop_loss: float, take_profit: float) -> Dict[str, Any]:
         async with self.lock:
             if self.order_open:
                 mensaje = f"❌ Orden cerrada por *{razon}*. Precio de entrada: {self.entry_price:.2f}"
-                await self.enviar_mensaje_telegram(mensaje)
-                await notify_telegram(mensaje)
+                logging.info(mensaje)
+                await notify_telegram(mensaje, markdown=True)
+                if SIMULATE:
+                    self.order_open = False
+                    self.entry_price = 0.0
+                    self.trailing_stop = None
+                    return {"status": "simulated", "reason": razon}
                 saldo = await self.obtener_saldo_total()
                 _, _, atr = await self.calcular_probabilidades(self.symbol)
                 distancia_sl = atr * self.config["ATR_MULTIPLIER_STOP"]
                 posicion_sugerida = (saldo * self.config["CAPITAL_POR_OPERACION"]) / distancia_sl if distancia_sl > 0 else 0
-                indicadores = await self.obtener_indicadores(self.symbol)
+                indicadores = await self.get_indicators(self.symbol)
                 await self.log_trade("venta", self.entry_price, stop_loss, take_profit, posicion_sugerida, indicadores)
                 self.order_open = False
                 self.entry_price = 0.0
                 self.trailing_stop = None
+                return {"status": "closed", "reason": razon}
+        return {}
 
-    async def abrir_orden(self, tipo_orden):
+    async def abrir_orden(self, tipo_orden: str) -> Dict[str, Any]:
         async with self.lock:
             if not self.order_open:
+                if SIMULATE:
+                    self.order_open = True
+                    self.entry_price = 0.0
+                    self.trailing_stop = None
+                    mensaje = f"✅ [SIM] Orden de *{tipo_orden}* abierta."
+                    logging.info(mensaje)
+                    await notify_telegram(mensaje, markdown=True)
+                    return {"status": "simulated", "side": tipo_orden}
                 self.order_open = True
                 self.entry_price = await self.obtener_precio(self.symbol)
                 _, _, atr = await self.calcular_probabilidades(self.symbol)
@@ -477,13 +547,18 @@ class AsyncTradingBot:
                 distancia_sl = atr * self.config["ATR_MULTIPLIER_STOP"]
                 posicion_sugerida = riesgo_operacion / distancia_sl if distancia_sl > 0 else 0
 
-                mensaje = (f"✅ Orden de *{tipo_orden}* abierta.\n"
-                           f"Precio de entrada: {self.entry_price:.2f}\n"
-                           f"Tamaño de posición sugerido: {posicion_sugerida:.4f} unidades")
-                await self.enviar_mensaje_telegram(mensaje)
-                await notify_telegram(mensaje)
+                mensaje = (
+                    f"✅ Orden de *{tipo_orden}* abierta.\n"
+                    f"Precio de entrada: {self.entry_price:.2f}\n"
+                    f"Tamaño de posición sugerido: {posicion_sugerida:.4f} unidades"
+                )
+                logging.info(mensaje)
+                await notify_telegram(mensaje, markdown=True)
+                return {"status": "opened", "side": tipo_orden}
+        return {}
 
-    async def evaluar_mercado(self):
+    async def evaluar_mercado(self) -> None:
+        """Evalúa el mercado y decide si abrir o cerrar órdenes."""
         async with self.lock:
             compra_prob, venta_prob, _ = await self.calcular_probabilidades(self.symbol)
             tendencia = await self.obtener_tendencia()
@@ -499,16 +574,20 @@ class AsyncTradingBot:
                 else:
                     logging.info("Señal de venta, pero la tendencia es alcista. Se mantiene la posición.")
 
-    async def enviar_mercado_telegram(self):
+    async def enviar_mercado_telegram(self) -> None:
+        """Envía un resumen del mercado a Telegram."""
         precio_actual = await self.obtener_precio(self.symbol)
         compra_prob, venta_prob, _ = await self.calcular_probabilidades(self.symbol)
-        mensaje = (f"📈 *Estado del Mercado* 📉\n\n"
-                   f"💲 *Precio {self.symbol}:* {precio_actual:.2f} USDT\n"
-                   f"🟢 *Prob. de Comprar:* {compra_prob}%\n"
-                   f"🔴 *Prob. de Vender:* {venta_prob}%")
-        await self.enviar_mensaje_telegram(mensaje)
+        mensaje = (
+            f"📈 *Estado del Mercado* 📉\n\n"
+            f"💲 *Precio {self.symbol}:* {precio_actual:.2f} USDT\n"
+            f"🟢 *Prob. de Comprar:* {compra_prob}%\n"
+            f"🔴 *Prob. de Vender:* {venta_prob}%"
+        )
+        await notify_telegram(mensaje, markdown=True)
 
-    async def manejar_comandos_telegram(self):
+    async def manejar_comandos_telegram(self) -> None:
+        """Procesa comandos enviados por Telegram."""
         url = f"https://api.telegram.org/bot{self.config['TELEGRAM_TOKEN']}/getUpdates?offset={self.last_update_id + 1}"
         try:
             async with self.session.get(url) as response:
@@ -527,14 +606,14 @@ class AsyncTradingBot:
                 await self.backtest_strategy()
 
     # -------------------- MÓDULO DE MACHINE LEARNING --------------------
-    async def actualizar_parametros_ml(self):
+    async def actualizar_parametros_ml(self) -> None:
+        """Actualiza los parámetros de ML con datos recientes."""
         current_umbral_compra = self.config["UMBRAL_COMPRA"]
         current_umbral_venta = self.config["UMBRAL_VENTA"]
-        current_indicators = await self.obtener_indicadores(self.symbol)
+        current_indicators = await self.get_indicators(self.symbol)
 
-        loop = asyncio.get_event_loop()
-        nuevo_umbral_compra, nuevo_umbral_venta = await loop.run_in_executor(
-            None, entrenar_y_optimizar_parametros, "trading_log.db", current_umbral_compra, current_umbral_venta, current_indicators
+        nuevo_umbral_compra, nuevo_umbral_venta = await entrenar_y_optimizar_parametros(
+            "trading_log.db", current_umbral_compra, current_umbral_venta, current_indicators
         )
         self.config["UMBRAL_COMPRA"] = nuevo_umbral_compra
         self.config["UMBRAL_VENTA"] = nuevo_umbral_venta
@@ -543,7 +622,8 @@ class AsyncTradingBot:
             f"Umbral Venta actualizado a {nuevo_umbral_venta}"
         )
 
-    async def task_actualizacion_ml(self):
+    async def task_actualizacion_ml(self) -> None:
+        """Tarea periódica para la actualización de parámetros ML."""
         while True:
             try:
                 await self.actualizar_parametros_ml()
@@ -552,32 +632,25 @@ class AsyncTradingBot:
             await asyncio.sleep(3600)
 
     # -------------------- BACKTESTING MEJORADO --------------------
-    async def backtest_strategy(self):
-        """
-        Realiza una simulación mejorada de la estrategia usando datos históricos.
-        Se generan señales de entrada y salida basadas en indicadores (RSI, EMA, MACD, Bollinger Bands)
-        y se utiliza la tendencia (EMA de 50 períodos) para confirmar las señales.
-        """
+    async def backtest_strategy(self) -> None:
+        """Realiza una simulación de la estrategia usando datos históricos."""
         try:
-            # Se obtienen 300 velas de 1h para contar con suficientes datos (incluida la EMA de tendencia)
-            since = int((datetime.now(timezone.utc) - timedelta(hours=300)).timestamp() * 1000)
-            ohlcv = await self.fetch_with_retry(self.exchange.watch_ohlcv, self.symbol, '1h', since, 300)
+            ind = await self.get_indicators(self.symbol, '1h', 300)
         except Exception as e:
             logging.error("Error en backtesting: " + str(e))
-            await self.enviar_mensaje_telegram("Error en backtesting.")
+            await notify_telegram("Error en backtesting.", markdown=True)
             return
 
-        ohlcv = np.array(ohlcv)
-        open_prices = ohlcv[:, 1]
-        high_prices = ohlcv[:, 2]
-        low_prices = ohlcv[:, 3]
-        close_prices = ohlcv[:, 4]
-
-        # Cálculo de indicadores globales
-        rsi_array = talib.RSI(close_prices, timeperiod=14)
-        ema_array = talib.EMA(close_prices, timeperiod=20)
-        macd_array, _, _ = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
-        atr_array = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
+        open_prices = ind["open_prices"]
+        high_prices = ind["high_prices"]
+        low_prices = ind["low_prices"]
+        close_prices = ind["close_prices"]
+        rsi_array = ind["rsi_array"]
+        ema_array = ind["ema_array"]
+        macd_array = ind["macd_array"]
+        atr_array = ind["atr_array"]
+        upperband_array = ind["upperband_array"]
+        lowerband_array = ind["lowerband_array"]
         ema_trend = talib.EMA(close_prices, timeperiod=self.config["EMA_TREND_PERIOD"])
 
         profit_total = 0.0
@@ -598,19 +671,8 @@ class AsyncTradingBot:
             current_macd = macd_array[i]
             current_atr = atr_array[i] if not np.isnan(atr_array[i]) else 0
 
-            # Calculamos Bollinger Bands para una ventana de 20 velas
-            if i >= self.config["BBANDS_PERIOD"]:
-                window = close_prices[i - self.config["BBANDS_PERIOD"] + 1: i + 1]
-                upperband, middleband, lowerband = talib.BBANDS(window,
-                                                               timeperiod=self.config["BBANDS_PERIOD"],
-                                                               nbdevup=self.config["BBANDS_STD"],
-                                                               nbdevdn=self.config["BBANDS_STD"],
-                                                               matype=0)
-                current_upperband = upperband[-1]
-                current_lowerband = lowerband[-1]
-            else:
-                current_upperband = current_close
-                current_lowerband = current_close
+            current_upperband = upperband_array[i] if i < len(upperband_array) else current_close
+            current_lowerband = lowerband_array[i] if i < len(lowerband_array) else current_close
 
             # Se calculan las probabilidades de compra y venta
             compra = 0
@@ -662,7 +724,7 @@ class AsyncTradingBot:
             position = False
 
         msg = f"Backtesting: {trades} trades simulados. Beneficio neto: {profit_total:.2f} USDT."
-        await self.enviar_mensaje_telegram(msg)
+        await notify_telegram(msg, markdown=True)
 
     # -------------------- TAREAS PROGRAMADAS --------------------
     async def task_mercado(self):
@@ -724,8 +786,16 @@ class AsyncTradingBot:
         if self.session:
             await self.session.close()
 
-    async def log_trade(self, tipo, precio, stop_loss, take_profit, posicion, indicadores):
-        # Función para registrar una operación en la base de datos
+    async def log_trade(
+        self,
+        tipo: str,
+        precio: float,
+        stop_loss: float,
+        take_profit: float,
+        posicion: float,
+        indicadores: Dict[str, float],
+    ) -> None:
+        """Registra una operación en la base de datos."""
         fecha = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         async with self.db.execute(
             "INSERT INTO trades (fecha, tipo, par, cantidad, precio, stop_loss, take_profit, rsi, ema, macd, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -749,7 +819,12 @@ async def main():
         await bot.cerrar()
 
 
-async def test_order(symbol, side, amount):
+async def test_order(symbol: str, side: str, amount: float) -> None:
+    """Ejecuta una orden de prueba o la simula si está activado SIMULATE."""
+    if SIMULATE:
+        logging.info(f"[SIM] Test order {side} {amount} {symbol}")
+        await notify_telegram(f"[SIM] Test order {side} {amount} {symbol}", markdown=True)
+        return
     exchange = ccxt.binance({
         'apiKey': CONFIG['API_KEY'],
         'secret': CONFIG['API_SECRET'],
@@ -759,10 +834,10 @@ async def test_order(symbol, side, amount):
         await exchange.watch_ticker(symbol)
         order = await exchange.create_market_order(symbol, side, amount)
         print(order)
-        await notify_telegram(f"Test order {side} {amount} {symbol} ejecutada")
+        await notify_telegram(f"Test order {side} {amount} {symbol} ejecutada", markdown=True)
     except Exception as e:
         print(f"Error test order: {e}")
-        await notify_telegram(f"Error test order: {e}")
+        await notify_telegram(f"Error test order: {e}", markdown=True)
     finally:
         await exchange.close()
 
