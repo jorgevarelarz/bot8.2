@@ -38,7 +38,10 @@ CONFIG = {
     "EMA_TREND_PERIOD": 50,
     "BBANDS_PERIOD": 20,
     "BBANDS_STD": 2,
-    "BALANCE_UPDATE_INTERVAL": 300  # 5 minutos
+    "BALANCE_UPDATE_INTERVAL": 300,  # 5 minutos
+    "MAX_EXPOSURE_USDT": 100,
+    "MAX_RETRIES": 5,
+    "SIMULATE": False
 }
 
 # Configurar contexto SSL usando certifi
@@ -130,9 +133,21 @@ class AsyncTradingBot:
             'secret': config["API_SECRET"],
             'options': {'adjustForTimeDifference': True},
         })
+        # Filtrar par si no está disponible en Binance
+        try:
+            markets = asyncio.get_event_loop().run_until_complete(self.exchange.load_markets())
+            if self.symbol not in markets:
+                for m in markets:
+                    if m.endswith('/USDT'):
+                        self.symbol = m
+                        break
+                logging.info(f"Par {config.get('SYMBOL')} no soportado. Usando {self.symbol}")
+        except Exception as e:
+            logging.error(f"Error cargando mercados: {e}")
         self.db = None
         self.order_open = False
         self.entry_price = 0.0
+        self.current_amount = 0.0
         self.trailing_stop = None
         self.last_update_id = 0
         # Inicializamos last_balance_sent como offset-aware (por ejemplo, epoch en UTC)
@@ -234,7 +249,8 @@ class AsyncTradingBot:
         try:
             async with self.session.post(url, data=data) as resp:
                 if resp.status != 200:
-                    logging.error(f"Error al enviar mensaje a Telegram. Estado: {resp.status}")
+                    text = await resp.text()
+                    logging.error(f"Error al enviar mensaje a Telegram. URL:{url} Payload:{data} Resp:{text}")
         except Exception as e:
             logging.error(f"Excepción al enviar mensaje a Telegram: {e}")
 
@@ -286,6 +302,24 @@ class AsyncTradingBot:
                         continue
         return round(total_usdt, 2)
 
+    async def can_trade(self, amount_usdt):
+        if self.order_open:
+            return False
+        try:
+            balance = await self.fetch_with_retry(self.exchange.fetch_balance)
+        except Exception as e:
+            logging.error(f"Error al consultar balance: {e}")
+            return False
+        free_usdt = balance.get('free', {}).get('USDT', 0)
+        exposure = await self.obtener_saldo_total()
+        if free_usdt < amount_usdt:
+            logging.info("Balance insuficiente para operar")
+            return False
+        if exposure + amount_usdt > self.config.get('MAX_EXPOSURE_USDT', 0):
+            logging.info("Exposición máxima alcanzada")
+            return False
+        return True
+
     async def obtener_indicadores(self, par=None):
         if par is None:
             par = self.symbol
@@ -306,6 +340,7 @@ class AsyncTradingBot:
 
         rsi = talib.RSI(close_prices, timeperiod=14)[-1]
         ema = talib.EMA(close_prices, timeperiod=20)[-1]
+        ema_long = talib.EMA(close_prices, timeperiod=50)[-1]
         macd, _, _ = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
         atr = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)[-1]
         upperband, middleband, lowerband = talib.BBANDS(
@@ -318,6 +353,7 @@ class AsyncTradingBot:
         return {
             "rsi": round(rsi, 2),
             "ema": round(ema, 2),
+            "ema_long": round(ema_long, 2),
             "macd": round(macd[-1], 2),
             "atr": round(atr, 2),
             "last_price": round(last_price, 2),
@@ -379,6 +415,16 @@ class AsyncTradingBot:
 
         return compra, venta, atr
 
+    async def predict(self, features):
+        return 0  # Stub for ML model
+
+    async def should_trade(self):
+        indicadores = await self.obtener_indicadores(self.symbol)
+        if indicadores['ema'] > indicadores['ema_long']:
+            ml_score = await self.predict(indicadores)
+            return ml_score >= 0
+        return False
+
     async def obtener_precio(self, par=None):
         if par is None:
             par = self.symbol
@@ -422,44 +468,88 @@ class AsyncTradingBot:
     async def cerrar_orden(self, razon, stop_loss, take_profit):
         async with self.lock:
             if self.order_open:
-                mensaje = f"❌ Orden cerrada por *{razon}*. Precio de entrada: {self.entry_price:.2f}"
+                exit_price = await self.obtener_precio(self.symbol)
+                if not self.config.get('SIMULATE'):
+                    try:
+                        await self.place_order('sell', self.current_amount)
+                    except Exception as e:
+                        logging.error(f"Error al cerrar orden: {e}")
+                fee = exit_price * self.current_amount * self.config.get('COMISION_BINANCE', 0)
+                profit = (exit_price - self.entry_price) * self.current_amount - fee
+                mensaje = (f"❌ Orden cerrada por *{razon}*. Precio entrada: {self.entry_price:.2f}"
+                           f"\nPnL neto: {profit:.2f} USDT")
                 await self.enviar_mensaje_telegram(mensaje)
                 saldo = await self.obtener_saldo_total()
                 _, _, atr = await self.calcular_probabilidades(self.symbol)
                 distancia_sl = atr * self.config["ATR_MULTIPLIER_STOP"]
                 posicion_sugerida = (saldo * self.config["CAPITAL_POR_OPERACION"]) / distancia_sl if distancia_sl > 0 else 0
                 indicadores = await self.obtener_indicadores(self.symbol)
-                await self.log_trade("venta", self.entry_price, stop_loss, take_profit, posicion_sugerida, indicadores)
+                await self.log_trade("venta", exit_price, stop_loss, take_profit, posicion_sugerida, indicadores)
                 self.order_open = False
                 self.entry_price = 0.0
+                self.current_amount = 0.0
                 self.trailing_stop = None
+
+    async def place_order(self, side, amount):
+        for attempt in range(self.config.get('MAX_RETRIES', 3)):
+            try:
+                if self.config.get('SIMULATE'):
+                    logging.info(f"Simulación de orden {side} {amount} {self.symbol}")
+                    return {'price': await self.obtener_precio(self.symbol), 'filled': amount, 'fee': {'cost': 0}}
+                order = await self.exchange.create_market_order(self.symbol, side, amount)
+                return order
+            except Exception as e:
+                wait = (2 ** attempt) + random.random()
+                logging.error(f"Error al colocar orden ({attempt+1}): {e}")
+                if attempt == self.config.get('MAX_RETRIES', 3) - 1:
+                    raise
+                await asyncio.sleep(wait)
 
     async def abrir_orden(self, tipo_orden):
         async with self.lock:
             if not self.order_open:
+                precio = await self.obtener_precio(self.symbol)
+                amount = (await self.obtener_saldo_total()) * self.config["CAPITAL_POR_OPERACION"] / precio
+                if not await self.can_trade(amount * precio):
+                    return
+                try:
+                    order = await self.place_order(tipo_orden, amount)
+                except Exception as e:
+                    logging.error(f"No se pudo abrir la orden: {e}")
+                    return
                 self.order_open = True
-                self.entry_price = await self.obtener_precio(self.symbol)
+                self.entry_price = order['price']
+                self.current_amount = order['filled']
                 _, _, atr = await self.calcular_probabilidades(self.symbol)
                 self.trailing_stop = self.entry_price
 
-                saldo = await self.obtener_saldo_total()
-                riesgo_operacion = saldo * self.config["CAPITAL_POR_OPERACION"]
-                distancia_sl = atr * self.config["ATR_MULTIPLIER_STOP"]
-                posicion_sugerida = riesgo_operacion / distancia_sl if distancia_sl > 0 else 0
-
                 mensaje = (f"✅ Orden de *{tipo_orden}* abierta.\n"
                            f"Precio de entrada: {self.entry_price:.2f}\n"
-                           f"Tamaño de posición sugerido: {posicion_sugerida:.4f} unidades")
+                           f"Cantidad: {order['filled']:.4f}")
                 await self.enviar_mensaje_telegram(mensaje)
+                asyncio.create_task(self.monitor_trade(order['filled']))
+
+    async def monitor_trade(self, amount):
+        sl = self.entry_price * (1 - self.config['STOP_LOSS_PORCENTAJE'])
+        tp = self.entry_price * (1 + self.config['TAKE_PROFIT_PORCENTAJE'])
+        while self.order_open:
+            precio_actual = await self.obtener_precio(self.symbol)
+            if precio_actual <= sl:
+                await self.cerrar_orden('Stop Loss', sl, tp)
+                break
+            if precio_actual >= tp:
+                await self.cerrar_orden('Take Profit', sl, tp)
+                break
+            await asyncio.sleep(5)
 
     async def evaluar_mercado(self):
         async with self.lock:
             compra_prob, venta_prob, _ = await self.calcular_probabilidades(self.symbol)
             tendencia = await self.obtener_tendencia()
             logging.info(f"Probabilidades - Compra: {compra_prob}%, Venta: {venta_prob}%")
-            if compra_prob >= self.config["UMBRAL_COMPRA"] and not self.order_open:
+            if await self.should_trade() and not self.order_open:
                 if tendencia is None or tendencia:
-                    await self.abrir_orden("compra")
+                    await self.abrir_orden("buy")
                 else:
                     logging.info("Señal de compra, pero la tendencia es bajista. No se abre la orden.")
             elif venta_prob >= self.config["UMBRAL_VENTA"] and self.order_open:
@@ -711,9 +801,21 @@ except ImportError:
     logging.info("uvloop no disponible, se usará el loop estándar.")
 
 if __name__ == "__main__":
+    import sys
     bot = AsyncTradingBot(CONFIG)
-    try:
-        asyncio.run(bot.iniciar_bot())
-    except KeyboardInterrupt:
-        logging.info("Bot detenido por el usuario.")
-        asyncio.run(bot.cerrar())
+    if len(sys.argv) == 4:
+        symbol, side, amount = sys.argv[1], sys.argv[2], float(sys.argv[3])
+        bot.symbol = symbol
+        async def single_order():
+            await bot.setup()
+            try:
+                await bot.place_order(side, amount)
+            finally:
+                await bot.cerrar()
+        asyncio.run(single_order())
+    else:
+        try:
+            asyncio.run(bot.iniciar_bot())
+        except KeyboardInterrupt:
+            logging.info("Bot detenido por el usuario.")
+            asyncio.run(bot.cerrar())
